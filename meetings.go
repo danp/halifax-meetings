@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"net/url"
@@ -13,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/jxskiss/base62"
 	"golang.org/x/time/rate"
 )
 
@@ -107,7 +107,7 @@ func saveMeeting(ctx context.Context, db *sql.DB, m Meeting, agenda MeetingAgend
 
 	contentSum := sha256.New224()
 	fmt.Fprintln(contentSum, agenda.ContentHTML)
-	contentID := base64.RawURLEncoding.EncodeToString(contentSum.Sum(nil))
+	contentID := base62.EncodeToString(contentSum.Sum(nil))
 
 	agendaURL := m.URL("agenda")
 	if agendaURL == "" {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jxskiss/base62"
 	"golang.org/x/time/rate"
 )
 
@@ -215,7 +215,7 @@ func fetchURLContent(ctx context.Context, u string) (_ urlContent, rerr error) {
 		return urlContent{}, fmt.Errorf("fetch: %w", err)
 	}
 
-	contentID := base64.RawURLEncoding.EncodeToString(contentSum.Sum(nil))
+	contentID := base62.EncodeToString(contentSum.Sum(nil))
 
 	if _, err := f.Seek(0, 0); err != nil {
 		return urlContent{}, fmt.Errorf("fetch: %w", err)
