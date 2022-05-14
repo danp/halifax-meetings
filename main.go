@@ -34,7 +34,7 @@ func main() {
 	fs := flag.NewFlagSet("halifax-meetings", flag.ExitOnError)
 	var only commaSeparatedString
 	fs.Var(&only, "only", "only run these comma-separated actions")
-	fs.Parse(os.Args)
+	fs.Parse(os.Args[1:])
 
 	type action struct {
 		name string
