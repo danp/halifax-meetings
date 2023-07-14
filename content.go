@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,6 +26,10 @@ type content struct {
 }
 
 func processExternalContentURLs(ctx context.Context, db *sql.DB, limiter *rate.Limiter, args []string) error {
+	if err := checkPDF(); err != nil {
+		return err
+	}
+
 	urls, err := unfetchedURLs(ctx, db)
 	if err != nil {
 		return fmt.Errorf("unfetched urls: %w", err)
@@ -237,8 +242,18 @@ type pdf struct {
 	text  string
 }
 
+func checkPDF() error {
+	for _, cmd := range []string{"pdfinfo", "pdftotext", "pdftoppm", "tesseract"} {
+		_, err := exec.LookPath(cmd)
+		if err != nil {
+			return fmt.Errorf("missing %v, need to install poppler-utils and tesseract-ocr on ubuntu or poppler and tesseract via homebrew: %w", cmd, err)
+		}
+	}
+	return nil
+}
+
 func processPDF(ctx context.Context, f *os.File) (pdf, error) {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	tc := exec.CommandContext(ctx, "pdfinfo", f.Name())
@@ -266,6 +281,44 @@ func processPDF(ctx context.Context, f *os.File) (pdf, error) {
 		return pdf{}, fmt.Errorf("pdftotext: %w", err)
 	}
 
-	text := strings.TrimSpace(string(out))
-	return pdf{title, text}, nil
+	if text := strings.TrimSpace(string(out)); text != "" {
+		return pdf{title, text}, nil
+	}
+
+	td, err := os.MkdirTemp("", "processPDF")
+	if err != nil {
+		return pdf{}, fmt.Errorf("mkdir temp: %w", err)
+	}
+	defer os.RemoveAll(td)
+
+	tc = exec.CommandContext(ctx, "pdftoppm", "-png", f.Name(), filepath.Join(td, "page"))
+	if err := tc.Run(); err != nil {
+		return pdf{}, fmt.Errorf("pdftoppm: %w", err)
+	}
+
+	pageFns, err := filepath.Glob(filepath.Join(td, "page*.png"))
+	if err != nil {
+		return pdf{}, fmt.Errorf("glob: %w", err)
+	}
+
+	for _, pageFn := range pageFns {
+		if err := exec.CommandContext(ctx, "tesseract", pageFn, pageFn).Run(); err != nil {
+			return pdf{}, fmt.Errorf("tesseract: %w", err)
+		}
+	}
+
+	textFns, err := filepath.Glob(filepath.Join(td, "page*.txt"))
+	if err != nil {
+		return pdf{}, fmt.Errorf("glob: %w", err)
+	}
+
+	var text string
+	for _, textFn := range textFns {
+		b, err := os.ReadFile(textFn)
+		if err != nil {
+			return pdf{}, fmt.Errorf("read text: %w", err)
+		}
+		text += string(b) + "\n"
+	}
+	return pdf{title, strings.TrimSpace(text)}, nil
 }

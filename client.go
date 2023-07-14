@@ -38,6 +38,10 @@ func (m Meeting) URL(name string) string {
 	return ""
 }
 
+type MeetingAgenda struct {
+	ContentHTML string // should be consistently formatted
+}
+
 type Client struct {
 	Limiter func()
 }
@@ -132,10 +136,6 @@ func (c Client) List(ctx context.Context, token string) (_ []Meeting, nextToken 
 	nextToken = abs(nextLink.AttrOr("href", ""))
 
 	return meetings, nextToken, nil
-}
-
-type MeetingAgenda struct {
-	ContentHTML string // should be consistently formatted
 }
 
 func (c Client) Agenda(ctx context.Context, agendaURL string) (MeetingAgenda, error) {
