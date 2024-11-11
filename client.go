@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
+	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/yosssi/gohtml"
 	"golang.org/x/net/html"
@@ -24,6 +29,7 @@ type MeetingEvent struct {
 }
 
 type Meeting struct {
+	ID    string
 	Type  string
 	Event MeetingEvent
 	URLs  []MeetingURL
@@ -40,6 +46,8 @@ func (m Meeting) URL(name string) string {
 
 type MeetingAgenda struct {
 	ContentHTML string // should be consistently formatted
+	ContentText string // should be consistently formatted
+	ContentURLs []string
 }
 
 type Client struct {
@@ -129,6 +137,13 @@ func (c Client) List(ctx context.Context, token string) (_ []Meeting, nextToken 
 			m.URLs = append(m.URLs, MeetingURL{k, s})
 		}
 
+		// sometimes we get things like https://www.halifax.ca/city-hallboards-committees-commissions
+		// try and account for that
+		id := strings.TrimPrefix(urls["agenda"], "https://www.halifax.ca/city-hall")
+		id = strings.TrimPrefix(id, "/")
+		id = strings.TrimPrefix(id, "http://legacycontent.halifax.ca/council/")
+		m.ID = id
+
 		meetings = append(meetings, m)
 	}
 
@@ -174,7 +189,271 @@ func (c Client) Agenda(ctx context.Context, agendaURL string) (MeetingAgenda, er
 		return MeetingAgenda{}, fmt.Errorf("url=%v did not find content", agendaURL)
 	}
 
-	return MeetingAgenda{ContentHTML: contentHTML}, nil
+	contentLines := strings.Split(strings.TrimSpace(content.Text()), "\n")
+	var contentText string
+	for _, l := range contentLines {
+		l = strings.TrimRightFunc(l, unicode.IsSpace)
+		if l == "" && strings.HasSuffix(contentText, "\n\n") {
+			continue
+		}
+		contentText += l + "\n"
+	}
+
+	agenda := MeetingAgenda{ContentHTML: contentHTML, ContentText: contentText}
+
+	agendaURLU, err := url.Parse(agendaURL)
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("bad agenda URL %v: %w", agendaURL, err)
+	}
+
+	for _, a := range nodes(content.Find("a")) {
+		href := abs(agendaURLU, a.AttrOr("href", ""))
+		if !strings.HasPrefix(href, "https://www.halifax.ca/media") {
+			continue
+		}
+		agenda.ContentURLs = append(agenda.ContentURLs, href)
+	}
+
+	return agenda, nil
+}
+
+type EscribeClient struct {
+	Limiter func()
+}
+
+func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nextToken string, _ error) {
+	if token != "" {
+		return nil, "", fmt.Errorf("escribe does not support pagination")
+	}
+
+	const u = "https://pub-halifax.escribemeetings.com"
+	baseU, err := url.Parse(u)
+	if err != nil {
+		return nil, "", fmt.Errorf("parsing URL: %w", err)
+	}
+
+	abs := func(su string) string {
+		if su == "" {
+			return ""
+		}
+		rel, err := url.Parse(su)
+		if err != nil {
+			return ""
+		}
+		return baseU.ResolveReference(rel).String()
+	}
+
+	now := time.Now()
+
+	var body struct {
+		CalendarStartDate time.Time `json:"calendarStartDate"`
+		CalendarEndDate   time.Time `json:"calendarEndDate"`
+	}
+	body.CalendarStartDate = now.AddDate(-1, 0, 0)
+	body.CalendarEndDate = now.AddDate(1, 0, 0)
+
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u+"/MeetingsCalendarView.aspx/GetAllMeetings", bytes.NewReader(b))
+	if err != nil {
+		return nil, "", fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	if c.Limiter != nil {
+		c.Limiter()
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	b, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("bad status %v: %v", resp.StatusCode, string(b))
+	}
+
+	var respBody struct {
+		D []struct {
+			AllowPublicComments     bool   `json:"AllowPublicComments"`
+			ClassName               string `json:"ClassName"`
+			DelegationRequestLink   string `json:"DelegationRequestLink"`
+			Description             string `json:"Description"`
+			EndDate                 string `json:"EndDate"`
+			FormattedStart          string `json:"FormattedStart"`
+			HasAgenda               bool   `json:"HasAgenda"`
+			HasLiveVideo            bool   `json:"HasLiveVideo"`
+			HasVideo                bool   `json:"HasVideo"`
+			HasVideoLivePassed      bool   `json:"HasVideoLivePassed"`
+			ID                      string `json:"ID"`
+			IsMP3                   bool   `json:"IsMP3"`
+			LanguageName            string `json:"LanguageName"`
+			LiveVideoStandAloneLink string `json:"LiveVideoStandAloneLink"`
+			Location                string `json:"Location"`
+			MeetingDocumentLink     []struct {
+				AriaLabel          string `json:"AriaLabel"`
+				CSSClass           string `json:"CssClass"`
+				Format             string `json:"Format"`
+				HasLiveVideo       bool   `json:"HasLiveVideo"`
+				HasLiveVideoPassed bool   `json:"HasLiveVideoPassed"`
+				HasVideo           bool   `json:"HasVideo"`
+				HiddenText         string `json:"HiddenText"`
+				Image              string `json:"Image"`
+				LanguageCode       string `json:"LanguageCode"`
+				LanguageID         int    `json:"LanguageId"`
+				MeetingName        string `json:"MeetingName"`
+				Sequence           any    `json:"Sequence"`
+				Title              string `json:"Title"`
+				Type               string `json:"Type"`
+				URL                string `json:"Url"`
+			} `json:"MeetingDocumentLink"`
+			MeetingName    string `json:"MeetingName"`
+			MeetingPassed  bool   `json:"MeetingPassed"`
+			MeetingType    string `json:"MeetingType"`
+			PortalID       string `json:"PortalId"`
+			ShareURL       string `json:"ShareUrl"`
+			Sharing        bool   `json:"Sharing"`
+			StartDate      string `json:"StartDate"`
+			TimeOverride   string `json:"TimeOverride"`
+			TimeOverrideFR string `json:"TimeOverrideFR"`
+			URL            string `json:"Url"`
+		} `json:"d"`
+	}
+
+	if err := json.Unmarshal(b, &respBody); err != nil {
+		return nil, "", fmt.Errorf("unmarshal: %w", err)
+	}
+
+	var meetings []Meeting
+	for _, dm := range respBody.D {
+		startDate, _, ok := strings.Cut(dm.StartDate, " ")
+		if !ok {
+			return nil, "", fmt.Errorf("bad start date %q", dm.StartDate)
+		}
+		date, err := time.Parse("2006/01/02", startDate)
+		if err != nil {
+			return nil, "", fmt.Errorf("bad date %q: %w", startDate, err)
+		}
+
+		meetingType := dm.MeetingType
+		if meetingType == "Halifax Regional Council" {
+			meetingType = "Regional Council"
+		}
+
+		m := Meeting{
+			ID:   dm.ID,
+			Type: meetingType,
+			Event: MeetingEvent{
+				Date: date,
+			},
+		}
+		for _, dl := range dm.MeetingDocumentLink {
+			if dl.Type == "Agenda" && dl.Format == "HTML" {
+				m.URLs = append(m.URLs, MeetingURL{"agenda", abs(dl.URL)})
+				continue
+			}
+			if dl.Type == "AdditionalDocuments" && dl.Format == ".pdf" && strings.Contains(dl.Title, "Minutes") {
+				m.URLs = append(m.URLs, MeetingURL{"minutes", abs(dl.URL)})
+				continue
+			}
+			if dl.Type == "Video" {
+				m.URLs = append(m.URLs, MeetingURL{"video", abs(dl.URL)})
+				continue
+			}
+		}
+
+		meetings = append(meetings, m)
+	}
+
+	return meetings, "", nil
+}
+
+func (c EscribeClient) Agenda(ctx context.Context, agendaURL string) (MeetingAgenda, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", agendaURL, nil)
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("new request: %w", err)
+	}
+
+	if c.Limiter != nil {
+		c.Limiter()
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return MeetingAgenda{}, fmt.Errorf("bad status %v", resp.StatusCode)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("new document: %w", err)
+	}
+
+	content := doc.Find(".AgendaItems")
+	contentHTML, err := content.Html()
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("getting content: %w", err)
+	}
+	contentHTML = gohtml.Format(contentHTML)
+
+	if len(contentHTML) == 0 {
+		return MeetingAgenda{}, fmt.Errorf("url=%v did not find content", agendaURL)
+	}
+
+	content.Find(".AgendaItemIcons").Remove()
+
+	agendaURLU, err := url.Parse(agendaURL)
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("bad agenda URL %v: %w", agendaURL, err)
+	}
+
+	for _, s := range content.Find("a").EachIter() {
+		if strings.HasPrefix(s.AttrOr("href", ""), "javascript:") {
+			ch, err := s.Html()
+			if err != nil {
+				return MeetingAgenda{}, fmt.Errorf("getting content: %w", err)
+			}
+			s.Parent().ReplaceWithHtml(ch)
+			continue
+		}
+		href := abs(agendaURLU, s.AttrOr("href", ""))
+		s.SetAttr("href", href)
+	}
+
+	contentHTMLNoJavascript, err := content.Html()
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("getting content: %w", err)
+	}
+
+	md, err := htmltomarkdown.ConvertString(contentHTMLNoJavascript)
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("converting to markdown: %w", err)
+	}
+
+	agenda := MeetingAgenda{ContentHTML: contentHTML, ContentText: md}
+
+	for _, a := range nodes(content.Find("a.Link")) {
+		href := abs(agendaURLU, a.AttrOr("href", ""))
+		if href == "" {
+			continue
+		}
+		agenda.ContentURLs = append(agenda.ContentURLs, href)
+	}
+
+	return agenda, nil
 }
 
 func nodes(s *goquery.Selection) []*goquery.Selection {
