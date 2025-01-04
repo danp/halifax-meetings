@@ -10,12 +10,10 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"unicode"
 
 	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/yosssi/gohtml"
-	"golang.org/x/net/html"
 )
 
 type MeetingURL struct {
@@ -108,7 +106,7 @@ func (c Client) List(ctx context.Context, token string) (_ []Meeting, nextToken 
 	}
 
 	var meetings []Meeting
-	for _, tr := range nodes(table.Find("tbody > tr")) {
+	for _, tr := range table.Find("tbody > tr").EachIter() {
 		var m Meeting
 		var (
 			mTime = strings.TrimSpace(tr.Find("td:nth-child(1) time").Text())
@@ -189,30 +187,31 @@ func (c Client) Agenda(ctx context.Context, agendaURL string) (MeetingAgenda, er
 		return MeetingAgenda{}, fmt.Errorf("url=%v did not find content", agendaURL)
 	}
 
-	contentLines := strings.Split(strings.TrimSpace(content.Text()), "\n")
-	var contentText string
-	for _, l := range contentLines {
-		l = strings.TrimRightFunc(l, unicode.IsSpace)
-		if l == "" && strings.HasSuffix(contentText, "\n\n") {
-			continue
-		}
-		contentText += l + "\n"
-	}
-
-	agenda := MeetingAgenda{ContentHTML: contentHTML, ContentText: contentText}
+	agenda := MeetingAgenda{ContentHTML: contentHTML}
 
 	agendaURLU, err := url.Parse(agendaURL)
 	if err != nil {
 		return MeetingAgenda{}, fmt.Errorf("bad agenda URL %v: %w", agendaURL, err)
 	}
 
-	for _, a := range nodes(content.Find("a")) {
+	for _, a := range content.Find("a").EachIter() {
 		href := abs(agendaURLU, a.AttrOr("href", ""))
-		if !strings.HasPrefix(href, "https://www.halifax.ca/media") {
-			continue
+		a.SetAttr("href", href)
+		if strings.Contains(href, "halifax.ca/media") || strings.Contains(href, "cdn.halifax.ca") {
+			agenda.ContentURLs = append(agenda.ContentURLs, href)
 		}
-		agenda.ContentURLs = append(agenda.ContentURLs, href)
 	}
+
+	contentHTML, err = content.Html()
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("getting content: %w", err)
+	}
+
+	md, err := markdown(contentHTML)
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("converting to markdown: %w", err)
+	}
+	agenda.ContentText = md
 
 	return agenda, nil
 }
@@ -356,9 +355,11 @@ func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nex
 				Date: date,
 			},
 		}
+		var hasAgenda bool
 		for _, dl := range dm.MeetingDocumentLink {
 			if dl.Type == "Agenda" && dl.Format == "HTML" {
 				m.URLs = append(m.URLs, MeetingURL{"agenda", abs(dl.URL)})
+				hasAgenda = true
 				continue
 			}
 			if dl.Type == "AdditionalDocuments" && dl.Format == ".pdf" && strings.Contains(dl.Title, "Minutes") {
@@ -369,6 +370,11 @@ func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nex
 				m.URLs = append(m.URLs, MeetingURL{"video", abs(dl.URL)})
 				continue
 			}
+		}
+
+		// Budget Committee - Continuation
+		if !hasAgenda && strings.Contains(m.Type, "Continuation") {
+			continue
 		}
 
 		meetings = append(meetings, m)
@@ -413,7 +419,18 @@ func (c EscribeClient) Agenda(ctx context.Context, agendaURL string) (MeetingAge
 		return MeetingAgenda{}, fmt.Errorf("url=%v did not find content", agendaURL)
 	}
 
+	// htmltomarkdown below does better with formatted HTML
+	doc, err = goquery.NewDocumentFromReader(strings.NewReader(contentHTML))
+	if err != nil {
+		return MeetingAgenda{}, fmt.Errorf("new document: %w", err)
+	}
+
+	content = doc.Selection
+
 	content.Find(".AgendaItemIcons").Remove()
+
+	// <img title="Attachments" src="./_layouts/images/eScribe/attachment.svg" alt="This item has attachments." role="presentation">
+	content.Find(`img[title="Attachments"]`).Remove()
 
 	agendaURLU, err := url.Parse(agendaURL)
 	if err != nil {
@@ -426,26 +443,27 @@ func (c EscribeClient) Agenda(ctx context.Context, agendaURL string) (MeetingAge
 			if err != nil {
 				return MeetingAgenda{}, fmt.Errorf("getting content: %w", err)
 			}
-			s.Parent().ReplaceWithHtml(ch)
+			s.Parent().ReplaceWithHtml(strings.TrimSpace(ch))
 			continue
 		}
 		href := abs(agendaURLU, s.AttrOr("href", ""))
 		s.SetAttr("href", href)
 	}
 
-	contentHTMLNoJavascript, err := content.Html()
+	contentHTML, err = content.Html()
 	if err != nil {
 		return MeetingAgenda{}, fmt.Errorf("getting content: %w", err)
 	}
+	contentHTML = gohtml.Format(contentHTML)
 
-	md, err := htmltomarkdown.ConvertString(contentHTMLNoJavascript)
+	md, err := markdown(contentHTML)
 	if err != nil {
 		return MeetingAgenda{}, fmt.Errorf("converting to markdown: %w", err)
 	}
 
 	agenda := MeetingAgenda{ContentHTML: contentHTML, ContentText: md}
 
-	for _, a := range nodes(content.Find("a.Link")) {
+	for _, a := range content.Find("a.Link").EachIter() {
 		href := abs(agendaURLU, a.AttrOr("href", ""))
 		if href == "" {
 			continue
@@ -454,14 +472,6 @@ func (c EscribeClient) Agenda(ctx context.Context, agendaURL string) (MeetingAge
 	}
 
 	return agenda, nil
-}
-
-func nodes(s *goquery.Selection) []*goquery.Selection {
-	var out []*goquery.Selection
-	for _, n := range s.Nodes {
-		out = append(out, &goquery.Selection{Nodes: []*html.Node{n}})
-	}
-	return out
 }
 
 func abs(base *url.URL, su string) string {
@@ -473,4 +483,18 @@ func abs(base *url.URL, su string) string {
 		return ""
 	}
 	return base.ResolveReference(rel).String()
+}
+
+func markdown(s string) (string, error) {
+	md, err := htmltomarkdown.ConvertString(s)
+	if err != nil {
+		return "", fmt.Errorf("converting to markdown: %w", err)
+	}
+
+	var md2 string
+	for line := range strings.Lines(md) {
+		line = strings.TrimSpace(line)
+		md2 += line + "\n"
+	}
+	return md2, nil
 }
