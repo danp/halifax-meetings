@@ -12,14 +12,15 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/embed"
 	"golang.org/x/time/rate"
-	_ "modernc.org/sqlite"
 )
 
 func main() {
 	ctx := context.Background()
 
-	db, err := sql.Open("sqlite", "meetings.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite3", "file:meetings.db?_pragma=busy_timeout(5000)")
 	if err != nil {
 		log.Fatal(err)
 	}
