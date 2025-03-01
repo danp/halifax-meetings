@@ -263,9 +263,7 @@ func processPDF(ctx context.Context, f *os.File) (pdf, error) {
 	}
 
 	var title string
-	outs := string(out)
-	lines := strings.Split(outs, "\n")
-	for _, l := range lines {
+	for l := range strings.SplitSeq(string(out), "\n") {
 		if strings.HasPrefix(l, "Title:") {
 			title = l
 			break

@@ -127,7 +127,7 @@ type commaSeparatedString struct {
 
 func (c *commaSeparatedString) Set(s string) error {
 	c.vals = make(map[string]struct{})
-	for _, s := range strings.Split(s, ",") {
+	for s := range strings.SplitSeq(s, ",") {
 		c.vals[s] = struct{}{}
 	}
 	return nil
