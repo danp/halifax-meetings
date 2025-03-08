@@ -35,7 +35,7 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 	var needMeetings []meetingAgendaer
 
 	var (
-		halifaxCilent = Client{Limiter: waitLimiter}
+		halifaxClient = Client{Limiter: waitLimiter}
 		escribeClient = EscribeClient{Limiter: waitLimiter}
 	)
 
@@ -44,7 +44,7 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 		agendaer
 	}
 
-	for _, c := range []client{halifaxCilent, escribeClient} {
+	for _, c := range []client{halifaxClient, escribeClient} {
 		err := func() error {
 			var token string
 		outer:
