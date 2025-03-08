@@ -61,7 +61,7 @@ func main() {
 func initDB(db *sql.DB) error {
 	initQueries := []string{
 		`create table if not exists meeting_agenda_content (id text primary key, text text, html text)`,
-		`create table if not exists meetings (id text primary key, type text, date text, schedule_note text, last_observed datetime, agenda_url text, minutes_url text, video_url text, agenda_content_id references meeting_agenda_content (id))`,
+		`create table if not exists meetings (id text primary key, type text, date text, schedule_note text, last_observed datetime, updated datetime, agenda_url text, minutes_url text, video_url text, agenda_content_id references meeting_agenda_content (id))`,
 		`create table if not exists meeting_versions (meeting_id text references meetings (id), observed datetime, schedule_note text, agenda_url text, minutes_url text, video_url text, agenda_content_id references meeting_agenda_content (id), unique (meeting_id, schedule_note, agenda_url, minutes_url, video_url, agenda_content_id))`,
 		`create index if not exists meetings_agenda_content_id on meetings (agenda_content_id)`,
 		`create virtual table if not exists meeting_agenda_content_search using fts5(text, content=meeting_agenda_content)`,

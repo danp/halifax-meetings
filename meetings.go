@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -15,7 +16,7 @@ import (
 func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, args []string) error {
 	cutoff := time.Now().AddDate(0, -1, 0)
 	var maxObserved time.Time
-	if err := db.QueryRow("select max(observed) from meeting_versions").Scan(newTimeValue(&maxObserved)); err != nil {
+	if err := db.QueryRow("select max(last_observed) from meetings").Scan(newTimeValue(&maxObserved)); err != nil {
 		return fmt.Errorf("select max meeting_versions observed: %w", err)
 	}
 	if !maxObserved.IsZero() {
@@ -28,12 +29,6 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 		}
 	}
 
-	type meetingAgendaer struct {
-		m Meeting
-		a agendaer
-	}
-	var needMeetings []meetingAgendaer
-
 	var (
 		halifaxClient = Client{Limiter: waitLimiter}
 		escribeClient = EscribeClient{Limiter: waitLimiter}
@@ -44,6 +39,11 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 		agendaer
 	}
 
+	type meetingAgendaer struct {
+		m Meeting
+		a agendaer
+	}
+	var needMeetings []meetingAgendaer
 	for _, c := range []client{halifaxClient, escribeClient} {
 		err := func() error {
 			var token string
@@ -57,6 +57,11 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 				for _, m := range meetings {
 					if m.Event.Date.Before(cutoff) {
 						break outer
+					}
+					if fresh, err := isMeetingFresh(ctx, db, m); err != nil {
+						return fmt.Errorf("checking freshness: %w", err)
+					} else if fresh {
+						continue
 					}
 					needMeetings = append(needMeetings, meetingAgendaer{m, c})
 				}
@@ -74,7 +79,6 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 		}
 	}
 
-	// TODO: weed out ones we can consider done, such as have non-draft minutes
 	log.Println("need", len(needMeetings), "meetings >=", cutoff.Format(time.RFC3339))
 
 	for i, ma := range needMeetings {
@@ -89,6 +93,25 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 
 	log.Println("completed", len(needMeetings), "/", len(needMeetings), "meetings")
 	return nil
+}
+
+func isMeetingFresh(ctx context.Context, db *sql.DB, m Meeting) (bool, error) {
+	var lastObserved time.Time
+	if err := db.QueryRowContext(ctx, "select last_observed from meetings where id=?", m.ID).Scan(newTimeValue(&lastObserved)); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("select last observed: %w", err)
+	}
+
+	now := time.Now()
+
+	threshold := time.Hour
+	if m.Event.Date.Before(now.AddDate(0, 0, -7)) {
+		threshold = 24 * time.Hour
+	}
+
+	return now.Sub(lastObserved) < threshold, nil
 }
 
 type agendaer interface {
@@ -154,8 +177,8 @@ func saveMeeting(db *sql.DB, m Meeting, agenda MeetingAgenda, observed time.Time
 		return fmt.Errorf("insert meeting_versions: %w", err)
 	}
 
-	const lq = `update meetings set last_observed=(select max(observed) from meeting_versions where meeting_id=id) where id=?`
-	if _, err := tx.Exec(lq, m.ID); err != nil {
+	const lq = `update meetings set updated=(select max(observed) from meeting_versions where meeting_id=id), last_observed=? where id=?`
+	if _, err := tx.Exec(lq, newTimeValue(&observed), m.ID); err != nil {
 		return fmt.Errorf("update meetings last observed: %w", err)
 	}
 
