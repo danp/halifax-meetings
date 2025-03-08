@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"time"
 
 	"github.com/jxskiss/base62"
@@ -108,7 +109,8 @@ func isMeetingFresh(ctx context.Context, db *sql.DB, m Meeting) (bool, error) {
 
 	threshold := time.Hour
 	if m.Event.Date.Before(now.AddDate(0, 0, -7)) {
-		threshold = 24 * time.Hour
+		const jitter = 2 * time.Hour
+		threshold = 24*time.Hour + (rand.N(jitter) - jitter/2)
 	}
 
 	return now.Sub(lastObserved) < threshold, nil
