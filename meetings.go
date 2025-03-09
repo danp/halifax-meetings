@@ -107,7 +107,7 @@ func isMeetingFresh(ctx context.Context, db *sql.DB, m Meeting) (bool, error) {
 
 	now := time.Now()
 
-	threshold := time.Hour
+	threshold := time.Hour - 2*time.Minute // to account for hourly run jitter
 	if m.Event.Date.Before(now.AddDate(0, 0, -7)) {
 		const jitter = 2 * time.Hour
 		threshold = 24*time.Hour + (rand.N(jitter) - jitter/2)
