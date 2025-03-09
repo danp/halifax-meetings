@@ -16,12 +16,12 @@ import (
 
 func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, args []string) error {
 	cutoff := time.Now().AddDate(0, -1, 0)
-	var maxObserved time.Time
-	if err := db.QueryRow("select max(last_observed) from meetings").Scan(newTimeValue(&maxObserved)); err != nil {
-		return fmt.Errorf("select max meeting_versions observed: %w", err)
+	var maxUpdated time.Time
+	if err := db.QueryRow("select max(updated) from meetings").Scan(newTimeValue(&maxUpdated)); err != nil {
+		return fmt.Errorf("select max meetings updated: %w", err)
 	}
-	if !maxObserved.IsZero() {
-		cutoff = maxObserved.AddDate(0, -8, 0)
+	if !maxUpdated.IsZero() {
+		cutoff = maxUpdated.AddDate(0, -8, 0)
 	}
 
 	waitLimiter := func() {
