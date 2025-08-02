@@ -256,7 +256,7 @@ func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nex
 		return nil, "", fmt.Errorf("marshal: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u+"/MeetingsCalendarView.aspx/GetAllMeetings", bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u+"/MeetingsCalendarView.aspx/GetCalendarMeetings", bytes.NewReader(b))
 	if err != nil {
 		return nil, "", fmt.Errorf("new request: %w", err)
 	}
