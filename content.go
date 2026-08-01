@@ -8,14 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/jxskiss/base62"
+	"github.com/yosssi/gohtml"
 	"golang.org/x/time/rate"
 )
 
@@ -23,11 +27,16 @@ type content struct {
 	id    string
 	title string
 	text  string
+	html  string
 }
 
 func processExternalContentURLs(ctx context.Context, db *sql.DB, limiter *rate.Limiter, args []string) error {
 	if err := checkPDF(); err != nil {
 		return err
+	}
+
+	if err := enqueueMeetingMinutesURLs(ctx, db); err != nil {
+		return fmt.Errorf("enqueue meeting minutes urls: %w", err)
 	}
 
 	urls, err := unfetchedURLs(ctx, db)
@@ -60,6 +69,93 @@ func processExternalContentURLs(ctx context.Context, db *sql.DB, limiter *rate.L
 	log.Println("completed", len(urls), "external content urls")
 
 	return nil
+}
+
+func enqueueMeetingMinutesURLs(ctx context.Context, db *sql.DB) error {
+	type meetingMinutesURLs struct {
+		meetingID       string
+		agendaContentID sql.NullString
+		minutesURL      sql.NullString
+		minutesHTMLURL  string
+		added           time.Time
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	const q = `
+		select id, agenda_content_id, minutes_url, agenda_url, coalesce(updated, last_observed)
+		from meetings
+		where (minutes_url is not null and minutes_url != '')
+			or (agenda_url like 'https://pub-halifax.escribemeetings.com/Meeting.aspx%')`
+	rows, err := tx.QueryContext(ctx, q)
+	if err != nil {
+		return fmt.Errorf("select meeting minutes urls: %w", err)
+	}
+	defer rows.Close()
+
+	var meetings []meetingMinutesURLs
+	for rows.Next() {
+		var m meetingMinutesURLs
+		var agendaURL sql.NullString
+		if err := rows.Scan(&m.meetingID, &m.agendaContentID, &m.minutesURL, &agendaURL, newTimeValue(&m.added)); err != nil {
+			return fmt.Errorf("scan meeting minutes url: %w", err)
+		}
+		if agendaURL.Valid {
+			m.minutesHTMLURL = escribeMinutesHTMLURLForAgendaURL(agendaURL.String)
+		}
+		meetings = append(meetings, m)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("select meeting minutes urls: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close meeting minutes url rows: %w", err)
+	}
+
+	for _, m := range meetings {
+		urls := []string{m.minutesURL.String, m.minutesHTMLURL}
+
+		for _, u := range urls {
+			if u == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, "insert into external_content_urls (url, added) values (?, ?) on conflict do nothing", u, newTimeValue(&m.added)); err != nil {
+				return fmt.Errorf("insert external content URL %v: %w", u, err)
+			}
+			if m.agendaContentID.Valid {
+				if _, err := tx.ExecContext(ctx, "insert into meeting_external_content_urls (meeting_id, agenda_content_id, external_content_url) values (?, ?, ?) on conflict do nothing", m.meetingID, m.agendaContentID.String, u); err != nil {
+					return fmt.Errorf("insert meeting external content URL %v: %w", u, err)
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+func escribeMinutesHTMLURLForAgendaURL(agendaURL string) string {
+	u, err := url.Parse(agendaURL)
+	if err != nil || u.Scheme == "" || u.Host != "pub-halifax.escribemeetings.com" || u.Path != "/Meeting.aspx" {
+		return ""
+	}
+
+	q := u.Query()
+	if q.Get("Id") == "" {
+		return ""
+	}
+	q.Set("Agenda", "PostMinutes")
+	if q.Get("lang") == "" {
+		q.Set("lang", "English")
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func unfetchedURLs(ctx context.Context, db *sql.DB) ([]string, error) {
@@ -112,10 +208,10 @@ func processURL(ctx context.Context, db *sql.DB, u string) error {
 	}
 
 	if !exists {
-		switch uc.contentType {
+		switch uc.mediaType {
 		case "application/pdf":
 			p, perr := processPDF(ctx, uc.f)
-			if err != nil {
+			if perr != nil {
 				if err := saveErr(perr); err != nil {
 					return fmt.Errorf("save error: %w", err)
 				}
@@ -123,8 +219,20 @@ func processURL(ctx context.Context, db *sql.DB, u string) error {
 			}
 			c.title = p.title
 			c.text = p.text
+		case "text/html":
+			h, herr := processHTML(u, uc.f)
+			if herr != nil {
+				if err := saveErr(herr); err != nil {
+					return fmt.Errorf("save error: %w", err)
+				}
+				return nil
+			}
+			c.title = h.title
+			c.text = h.text
+			c.html = h.html
 		}
 	}
+	hasContent := exists || c.title != "" || c.text != "" || c.html != ""
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -132,7 +240,7 @@ func processURL(ctx context.Context, db *sql.DB, u string) error {
 	}
 	defer tx.Rollback()
 
-	if !exists {
+	if !exists && hasContent {
 		if err := saveContent(ctx, tx, c); err != nil {
 			return fmt.Errorf("saving content ID %v: %w", c.id, err)
 		}
@@ -144,7 +252,13 @@ func processURL(ctx context.Context, db *sql.DB, u string) error {
 		etag.String = uc.etag
 	}
 
-	if _, err := tx.Exec("update external_content_urls set fetched=?, content_type=?, size=?, last_modified=?, etag=?, error=?, external_content_id=? where url=?", newTimeValue(&now), uc.contentType, uc.size, newTimeValue(&uc.lastModified), etag, nil, c.id, u); err != nil {
+	var contentID sql.NullString
+	if hasContent {
+		contentID.Valid = true
+		contentID.String = c.id
+	}
+
+	if _, err := tx.Exec("update external_content_urls set fetched=?, content_type=?, size=?, last_modified=?, etag=?, error=?, external_content_id=? where url=?", newTimeValue(&now), uc.contentType, uc.size, newTimeValue(&uc.lastModified), etag, nil, contentID, u); err != nil {
 		return fmt.Errorf("update external_content_urls: %w", err)
 	}
 
@@ -163,7 +277,7 @@ func contentExists(ctx context.Context, db *sql.DB, id string) (bool, error) {
 }
 
 func saveContent(ctx context.Context, tx *sql.Tx, c content) error {
-	if _, err := tx.Exec("insert into external_content (id, title, text) values (?, ?, ?) on conflict do nothing", c.id, c.title, c.text); err != nil {
+	if _, err := tx.Exec("insert into external_content (id, title, text, html) values (?, ?, ?, ?) on conflict do nothing", c.id, c.title, c.text, c.html); err != nil {
 		return fmt.Errorf("insert content: %w", err)
 	}
 
@@ -174,9 +288,59 @@ func saveContent(ctx context.Context, tx *sql.Tx, c content) error {
 	return nil
 }
 
+type htmlContent struct {
+	title string
+	text  string
+	html  string
+}
+
+func processHTML(u string, f *os.File) (htmlContent, error) {
+	if _, err := f.Seek(0, 0); err != nil {
+		return htmlContent{}, fmt.Errorf("seek: %w", err)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(f)
+	if err != nil {
+		return htmlContent{}, fmt.Errorf("new document: %w", err)
+	}
+
+	title := strings.TrimSpace(doc.Find("title").First().Text())
+	content := doc.Find(".AgendaItems").First()
+	if content.Length() == 0 {
+		content = doc.Find("body").First()
+	}
+	if content.Length() == 0 {
+		return htmlContent{}, fmt.Errorf("did not find HTML content")
+	}
+
+	baseU, err := url.Parse(u)
+	if err != nil {
+		return htmlContent{}, fmt.Errorf("bad URL %v: %w", u, err)
+	}
+
+	for _, a := range content.Find("a").EachIter() {
+		a.SetAttr("href", abs(baseU, a.AttrOr("href", "")))
+	}
+	content.Find("script, style").Remove()
+
+	contentHTML, err := content.Html()
+	if err != nil {
+		return htmlContent{}, fmt.Errorf("getting content: %w", err)
+	}
+	contentHTML = gohtml.Format(contentHTML)
+
+	md, err := markdown(contentHTML)
+	if err != nil {
+		return htmlContent{}, fmt.Errorf("converting to markdown: %w", err)
+	}
+
+	return htmlContent{title: title, text: md, html: contentHTML}, nil
+}
+
 type urlContent struct {
 	f            *os.File
 	contentType  string
+	mediaType    string
 	contentID    string
 	size         int64
 	lastModified time.Time
@@ -234,7 +398,13 @@ func fetchURLContent(ctx context.Context, u string) (_ urlContent, rerr error) {
 		}
 	}
 
-	return urlContent{f, resp.Header.Get("Content-Type"), contentID, size, lastModified, resp.Header.Get("ETag")}, nil
+	contentType := resp.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = contentType
+	}
+
+	return urlContent{f, contentType, mediaType, contentID, size, lastModified, resp.Header.Get("ETag")}, nil
 }
 
 type pdf struct {

@@ -15,13 +15,19 @@ import (
 )
 
 func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, args []string) error {
-	cutoff := time.Now().AddDate(0, -1, 0)
+	now := time.Now()
+	cutoff := now.AddDate(0, -1, 0)
 	var maxUpdated time.Time
 	if err := db.QueryRow("select max(updated) from meetings").Scan(newTimeValue(&maxUpdated)); err != nil {
 		return fmt.Errorf("select max meetings updated: %w", err)
 	}
 	if !maxUpdated.IsZero() {
 		cutoff = maxUpdated.AddDate(0, -8, 0)
+	}
+	minCutoff := cutoff
+	regionalCouncilCutoff := now.AddDate(-2, 0, 0)
+	if regionalCouncilCutoff.Before(minCutoff) {
+		minCutoff = regionalCouncilCutoff
 	}
 
 	waitLimiter := func() {
@@ -55,9 +61,17 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 					return fmt.Errorf("listing meetings: %w", err)
 				}
 
+				allBeforeCutoff := true
 				for _, m := range meetings {
-					if m.Event.Date.Before(cutoff) {
-						break outer
+					meetingCutoff := cutoff
+					if m.Type == "Regional Council" {
+						meetingCutoff = regionalCouncilCutoff
+					}
+					if !m.Event.Date.Before(minCutoff) {
+						allBeforeCutoff = false
+					}
+					if m.Event.Date.Before(meetingCutoff) {
+						continue
 					}
 					if fresh, err := isMeetingFresh(ctx, db, m); err != nil {
 						return fmt.Errorf("checking freshness: %w", err)
@@ -65,6 +79,10 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 						continue
 					}
 					needMeetings = append(needMeetings, meetingAgendaer{m, c})
+				}
+
+				if allBeforeCutoff {
+					break outer
 				}
 
 				if nextToken == "" {
@@ -80,7 +98,7 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 		}
 	}
 
-	log.Println("need", len(needMeetings), "meetings >=", cutoff.Format(time.RFC3339))
+	log.Println("need", len(needMeetings), "meetings >=", minCutoff.Format(time.RFC3339))
 
 	for i, ma := range needMeetings {
 		if err := processMeeting(ctx, db, ma.a, ma.m); err != nil {
@@ -98,11 +116,16 @@ func processMeetings(ctx context.Context, db *sql.DB, limiter *rate.Limiter, arg
 
 func isMeetingFresh(ctx context.Context, db *sql.DB, m Meeting) (bool, error) {
 	var lastObserved time.Time
-	if err := db.QueryRowContext(ctx, "select last_observed from meetings where id=?", m.ID).Scan(newTimeValue(&lastObserved)); err != nil {
+	var agendaURL, minutesURL, videoURL sql.NullString
+	if err := db.QueryRowContext(ctx, "select last_observed, agenda_url, minutes_url, video_url from meetings where id=?", m.ID).Scan(newTimeValue(&lastObserved), &agendaURL, &minutesURL, &videoURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		return false, fmt.Errorf("select last observed: %w", err)
+	}
+
+	if agendaURL.String != m.URL("agenda") || minutesURL.String != m.URL("minutes") || videoURL.String != m.URL("video") {
+		return false, nil
 	}
 
 	now := time.Now()
@@ -188,7 +211,7 @@ func saveMeeting(db *sql.DB, m Meeting, agenda MeetingAgenda, observed time.Time
 		return fmt.Errorf("update meetings last observed: %w", err)
 	}
 
-	if err := saveMeetingURLs(tx, observed, m.ID, contentID, agenda); err != nil {
+	if err := saveMeetingURLs(tx, observed, m.ID, contentID, meetingContentURLs(m, agenda)); err != nil {
 		return fmt.Errorf("saving meeting links: %w", err)
 	}
 
@@ -198,8 +221,22 @@ func saveMeeting(db *sql.DB, m Meeting, agenda MeetingAgenda, observed time.Time
 	return nil
 }
 
-func saveMeetingURLs(tx *sql.Tx, observed time.Time, meetingID, agendaContentID string, agenda MeetingAgenda) error {
-	for _, u := range agenda.ContentURLs {
+func meetingContentURLs(m Meeting, agenda MeetingAgenda) []string {
+	urls := []string{m.URL("minutes"), m.URL("minutes_html")}
+	urls = append(urls, agenda.ContentURLs...)
+	return urls
+}
+
+func saveMeetingURLs(tx *sql.Tx, observed time.Time, meetingID, agendaContentID string, contentURLs []string) error {
+	urls := make(map[string]struct{})
+	for _, u := range contentURLs {
+		if u == "" {
+			continue
+		}
+		urls[u] = struct{}{}
+	}
+
+	for u := range urls {
 		if _, err := tx.Exec("insert into external_content_urls (url, added) values (?, ?) on conflict do nothing", u, newTimeValue(&observed)); err != nil {
 			return fmt.Errorf("insert external content URL %v: %w", u, err)
 		}

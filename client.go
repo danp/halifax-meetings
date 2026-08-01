@@ -220,6 +220,13 @@ type EscribeClient struct {
 	Limiter func()
 }
 
+type EscribeMeetingDocumentLink struct {
+	Format string `json:"Format"`
+	Title  string `json:"Title"`
+	Type   string `json:"Type"`
+	URL    string `json:"Url"`
+}
+
 func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nextToken string, _ error) {
 	if token != "" {
 		return nil, "", fmt.Errorf("escribe does not support pagination")
@@ -248,7 +255,7 @@ func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nex
 		CalendarStartDate time.Time `json:"calendarStartDate"`
 		CalendarEndDate   time.Time `json:"calendarEndDate"`
 	}
-	body.CalendarStartDate = now.AddDate(-1, 0, 0)
+	body.CalendarStartDate = now.AddDate(-2, 0, 0)
 	body.CalendarEndDate = now.AddDate(1, 0, 0)
 
 	b, err := json.Marshal(body)
@@ -283,48 +290,32 @@ func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nex
 
 	var respBody struct {
 		D []struct {
-			AllowPublicComments     bool   `json:"AllowPublicComments"`
-			ClassName               string `json:"ClassName"`
-			DelegationRequestLink   string `json:"DelegationRequestLink"`
-			Description             string `json:"Description"`
-			EndDate                 string `json:"EndDate"`
-			FormattedStart          string `json:"FormattedStart"`
-			HasAgenda               bool   `json:"HasAgenda"`
-			HasLiveVideo            bool   `json:"HasLiveVideo"`
-			HasVideo                bool   `json:"HasVideo"`
-			HasVideoLivePassed      bool   `json:"HasVideoLivePassed"`
-			ID                      string `json:"ID"`
-			IsMP3                   bool   `json:"IsMP3"`
-			LanguageName            string `json:"LanguageName"`
-			LiveVideoStandAloneLink string `json:"LiveVideoStandAloneLink"`
-			Location                string `json:"Location"`
-			MeetingDocumentLink     []struct {
-				AriaLabel          string `json:"AriaLabel"`
-				CSSClass           string `json:"CssClass"`
-				Format             string `json:"Format"`
-				HasLiveVideo       bool   `json:"HasLiveVideo"`
-				HasLiveVideoPassed bool   `json:"HasLiveVideoPassed"`
-				HasVideo           bool   `json:"HasVideo"`
-				HiddenText         string `json:"HiddenText"`
-				Image              string `json:"Image"`
-				LanguageCode       string `json:"LanguageCode"`
-				LanguageID         int    `json:"LanguageId"`
-				MeetingName        string `json:"MeetingName"`
-				Sequence           any    `json:"Sequence"`
-				Title              string `json:"Title"`
-				Type               string `json:"Type"`
-				URL                string `json:"Url"`
-			} `json:"MeetingDocumentLink"`
-			MeetingName    string `json:"MeetingName"`
-			MeetingPassed  bool   `json:"MeetingPassed"`
-			MeetingType    string `json:"MeetingType"`
-			PortalID       string `json:"PortalId"`
-			ShareURL       string `json:"ShareUrl"`
-			Sharing        bool   `json:"Sharing"`
-			StartDate      string `json:"StartDate"`
-			TimeOverride   string `json:"TimeOverride"`
-			TimeOverrideFR string `json:"TimeOverrideFR"`
-			URL            string `json:"Url"`
+			AllowPublicComments     bool                         `json:"AllowPublicComments"`
+			ClassName               string                       `json:"ClassName"`
+			DelegationRequestLink   string                       `json:"DelegationRequestLink"`
+			Description             string                       `json:"Description"`
+			EndDate                 string                       `json:"EndDate"`
+			FormattedStart          string                       `json:"FormattedStart"`
+			HasAgenda               bool                         `json:"HasAgenda"`
+			HasLiveVideo            bool                         `json:"HasLiveVideo"`
+			HasVideo                bool                         `json:"HasVideo"`
+			HasVideoLivePassed      bool                         `json:"HasVideoLivePassed"`
+			ID                      string                       `json:"ID"`
+			IsMP3                   bool                         `json:"IsMP3"`
+			LanguageName            string                       `json:"LanguageName"`
+			LiveVideoStandAloneLink string                       `json:"LiveVideoStandAloneLink"`
+			Location                string                       `json:"Location"`
+			MeetingDocumentLink     []EscribeMeetingDocumentLink `json:"MeetingDocumentLink"`
+			MeetingName             string                       `json:"MeetingName"`
+			MeetingPassed           bool                         `json:"MeetingPassed"`
+			MeetingType             string                       `json:"MeetingType"`
+			PortalID                string                       `json:"PortalId"`
+			ShareURL                string                       `json:"ShareUrl"`
+			Sharing                 bool                         `json:"Sharing"`
+			StartDate               string                       `json:"StartDate"`
+			TimeOverride            string                       `json:"TimeOverride"`
+			TimeOverrideFR          string                       `json:"TimeOverrideFR"`
+			URL                     string                       `json:"Url"`
 		} `json:"d"`
 	}
 
@@ -362,14 +353,16 @@ func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nex
 				hasAgenda = true
 				continue
 			}
-			if dl.Type == "AdditionalDocuments" && dl.Format == ".pdf" && strings.Contains(dl.Title, "Minutes") {
-				m.URLs = append(m.URLs, MeetingURL{"minutes", abs(dl.URL)})
-				continue
-			}
 			if dl.Type == "Video" {
 				m.URLs = append(m.URLs, MeetingURL{"video", abs(dl.URL)})
 				continue
 			}
+		}
+		if minutesURL := escribeMinutesURL(dm.MeetingDocumentLink, abs); minutesURL != "" {
+			m.URLs = append(m.URLs, MeetingURL{"minutes", minutesURL})
+		}
+		if minutesHTMLURL := escribePostMinutesHTMLURL(dm.MeetingDocumentLink, abs); minutesHTMLURL != "" {
+			m.URLs = append(m.URLs, MeetingURL{"minutes_html", minutesHTMLURL})
 		}
 
 		// Budget Committee - Continuation
@@ -381,6 +374,31 @@ func (c EscribeClient) List(ctx context.Context, token string) (_ []Meeting, nex
 	}
 
 	return meetings, "", nil
+}
+
+func escribeMinutesURL(links []EscribeMeetingDocumentLink, abs func(string) string) string {
+	var draftURL string
+	for _, dl := range links {
+		if !strings.EqualFold(dl.Format, ".pdf") {
+			continue
+		}
+		if dl.Type == "PostMinutes" {
+			return abs(dl.URL)
+		}
+		if draftURL == "" && dl.Type == "AdditionalDocuments" && strings.Contains(strings.ToLower(dl.Title), "minutes") {
+			draftURL = abs(dl.URL)
+		}
+	}
+	return draftURL
+}
+
+func escribePostMinutesHTMLURL(links []EscribeMeetingDocumentLink, abs func(string) string) string {
+	for _, dl := range links {
+		if dl.Type == "PostMinutes" && strings.EqualFold(dl.Format, "HTML") {
+			return abs(dl.URL)
+		}
+	}
+	return ""
 }
 
 func (c EscribeClient) Agenda(ctx context.Context, agendaURL string) (MeetingAgenda, error) {
